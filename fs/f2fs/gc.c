@@ -132,13 +132,13 @@ static void select_policy(struct f2fs_sb_info *sbi, int gc_type,
 		p->gc_mode = GC_GREEDY;
 		p->type = GET_SSR_TYPE(type);
 		p->dirty_segmap = dirty_i->dirty_segmap[p->type];
-		p->log_ofs_unit = 0;
+		p->ofs_unit = 1;
 	} else {
 		p->alloc_mode = LFS;
 		p->gc_mode = select_gc_type(gc_type);
 		p->type = 0;
 		p->dirty_segmap = dirty_i->dirty_segmap[DIRTY];
-		p->log_ofs_unit = sbi->log_segs_per_sec;
+		p->ofs_unit = sbi->segs_per_sec;
 	}
 	p->offset = sbi->last_victim[p->gc_mode];
 }
@@ -147,7 +147,7 @@ static unsigned int get_max_cost(struct f2fs_sb_info *sbi,
 				struct victim_sel_policy *p)
 {
 	if (p->gc_mode == GC_GREEDY)
-		return 1 << (sbi->log_blocks_per_seg + p->log_ofs_unit);
+		return (1 << sbi->log_blocks_per_seg) * p->ofs_unit;
 	else if (p->gc_mode == GC_CB)
 		return UINT_MAX;
 	else /* No other gc_mode */
@@ -177,7 +177,7 @@ static unsigned int get_cb_cost(struct f2fs_sb_info *sbi, unsigned int segno)
 {
 	struct sit_info *sit_i = SIT_I(sbi);
 	unsigned int secno = GET_SECNO(sbi, segno);
-	unsigned int start = secno << sbi->log_segs_per_sec;
+	unsigned int start = secno * sbi->segs_per_sec;
 	unsigned long long mtime = 0;
 	unsigned int vblocks;
 	unsigned char age = 0;
@@ -186,10 +186,10 @@ static unsigned int get_cb_cost(struct f2fs_sb_info *sbi, unsigned int segno)
 
 	for (i = 0; i < sbi->segs_per_sec; i++)
 		mtime += get_seg_entry(sbi, start + i)->mtime;
-	vblocks = get_valid_blocks(sbi, segno, sbi->log_segs_per_sec);
+	vblocks = get_valid_blocks(sbi, segno, sbi->segs_per_sec);
 
-	mtime >>= sbi->log_segs_per_sec;
-	vblocks >>= sbi->log_segs_per_sec;
+	mtime = div_u64(mtime, sbi->segs_per_sec);
+	vblocks = div_u64(vblocks, sbi->segs_per_sec);
 
 	u = (vblocks * 100) >> sbi->log_blocks_per_seg;
 
@@ -199,7 +199,7 @@ static unsigned int get_cb_cost(struct f2fs_sb_info *sbi, unsigned int segno)
 	if (mtime > sit_i->max_mtime)
 		sit_i->max_mtime = mtime;
 	if (sit_i->max_mtime != sit_i->min_mtime)
-		age = 100 - div64_64(100 * (mtime - sit_i->min_mtime),
+		age = 100 - div64_u64(100 * (mtime - sit_i->min_mtime),
 				sit_i->max_mtime - sit_i->min_mtime);
 
 	return UINT_MAX - ((100 * (100 - u) * age) / (100 + u));
@@ -213,7 +213,7 @@ static unsigned int get_gc_cost(struct f2fs_sb_info *sbi, unsigned int segno,
 
 	/* alloc_mode == LFS */
 	if (p->gc_mode == GC_GREEDY)
-		return get_valid_blocks(sbi, segno, sbi->log_segs_per_sec);
+		return get_valid_blocks(sbi, segno, sbi->segs_per_sec);
 	else
 		return get_cb_cost(sbi, segno);
 }
@@ -260,8 +260,7 @@ static int get_victim_by_default(struct f2fs_sb_info *sbi,
 			}
 			break;
 		}
-		p.offset = ((segno >> p.log_ofs_unit) << p.log_ofs_unit)
-				+ (1 << p.log_ofs_unit);
+		p.offset = ((segno / p.ofs_unit) * p.ofs_unit) + p.ofs_unit;
 
 		if (test_bit(segno, dirty_i->victim_segmap[FG_GC]))
 			continue;
@@ -288,10 +287,10 @@ static int get_victim_by_default(struct f2fs_sb_info *sbi,
 	}
 got_it:
 	if (p.min_segno != NULL_SEGNO) {
-		*result = (p.min_segno >> p.log_ofs_unit) << p.log_ofs_unit;
+		*result = (p.min_segno / p.ofs_unit) * p.ofs_unit;
 		if (p.alloc_mode == LFS) {
 			int i;
-			for (i = 0; i < (1 << p.log_ofs_unit); i++)
+			for (i = 0; i < p.ofs_unit; i++)
 				set_bit(*result + i,
 					dirty_i->victim_segmap[gc_type]);
 		}
@@ -771,7 +770,7 @@ void f2fs_update_stat(struct f2fs_sb_info *sbi)
 	for (i = CURSEG_HOT_DATA; i <= CURSEG_COLD_NODE; i++) {
 		struct curseg_info *curseg = CURSEG_I(sbi, i);
 		si->curseg[i] = curseg->segno;
-		si->cursec[i] = curseg->segno >> sbi->log_segs_per_sec;
+		si->cursec[i] = curseg->segno / sbi->segs_per_sec;
 		si->curzone[i] = si->cursec[i] / sbi->secs_per_zone;
 	}
 
@@ -795,11 +794,11 @@ void f2fs_update_gc_metric(struct f2fs_sb_info *sbi)
 
 	bimodal = 0;
 	total_vblocks = 0;
-	blks_per_sec = 1 << (sbi->log_segs_per_sec + sbi->log_blocks_per_seg);
+	blks_per_sec = sbi->segs_per_sec * (1 << sbi->log_blocks_per_seg);
 	hblks_per_sec = blks_per_sec / 2;
 	mutex_lock(&sit_i->sentry_lock);
 	for (segno = 0; segno < TOTAL_SEGS(sbi); segno += sbi->segs_per_sec) {
-		vblocks = get_valid_blocks(sbi, segno, sbi->log_segs_per_sec);
+		vblocks = get_valid_blocks(sbi, segno, sbi->segs_per_sec);
 		dist = abs(vblocks - hblks_per_sec);
 		bimodal += dist * dist;
 
@@ -980,7 +979,7 @@ static int f2fs_read_mem(char *page, char **start, off_t off,
 		base_mem += TOTAL_SEGS(sbi) * sizeof(struct seg_entry);
 		base_mem += f2fs_bitmap_size(TOTAL_SEGS(sbi));
 		base_mem += 2 * SIT_VBLOCK_MAP_SIZE * TOTAL_SEGS(sbi);
-		if (sbi->log_segs_per_sec)
+		if (sbi->segs_per_sec > 1)
 			base_mem += sbi->total_sections *
 					sizeof(struct sec_entry);
 		base_mem += __bitmap_size(sbi, SIT_BITMAP);
@@ -991,8 +990,8 @@ static int f2fs_read_mem(char *page, char **start, off_t off,
 		base_mem += f2fs_bitmap_size(sbi->total_sections);
 
 		/* build curseg */
-		base_mem += sizeof(struct curseg_info) * DEFAULT_CURSEGS;
-		base_mem += PAGE_CACHE_SIZE * DEFAULT_CURSEGS;
+		base_mem += sizeof(struct curseg_info) * NR_CURSEG_TYPE;
+		base_mem += PAGE_CACHE_SIZE * NR_CURSEG_TYPE;
 
 		/* build dirty segmap */
 		base_mem += sizeof(struct dirty_seglist_info);
