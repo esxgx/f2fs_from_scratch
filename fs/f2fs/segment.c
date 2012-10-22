@@ -19,12 +19,12 @@
 
 static int need_to_flush(struct f2fs_sb_info *sbi)
 {
-	unsigned int pages_per_sec = 1 << (sbi->log_blocks_per_seg +
-			sbi->log_segs_per_sec);
-	int node_secs = (get_pages(sbi, F2FS_DIRTY_NODES) + pages_per_sec - 1)
-		>> (sbi->log_blocks_per_seg + sbi->log_segs_per_sec);
-	int dent_secs = (get_pages(sbi, F2FS_DIRTY_DENTS) + pages_per_sec - 1)
-		>> (sbi->log_blocks_per_seg + sbi->log_segs_per_sec);
+	unsigned int pages_per_sec = (1 << sbi->log_blocks_per_seg) *
+			sbi->segs_per_sec;
+	int node_secs = ((get_pages(sbi, F2FS_DIRTY_NODES) + pages_per_sec - 1)
+		>> sbi->log_blocks_per_seg) / sbi->segs_per_sec;
+	int dent_secs = ((get_pages(sbi, F2FS_DIRTY_DENTS) + pages_per_sec - 1)
+		>> sbi->log_blocks_per_seg) / sbi->segs_per_sec;
 
 	if (sbi->por_doing)
 		return 0;
@@ -236,7 +236,7 @@ static void update_sit_entry(struct f2fs_sb_info *sbi, block_t blkaddr, int del)
 	/* update total number of valid blocks to be written in ckpt area */
 	SIT_I(sbi)->written_valid_blocks += del;
 
-	if (sbi->log_segs_per_sec)
+	if (sbi->segs_per_sec > 1)
 		get_sec_entry(sbi, segno)->valid_blocks += del;
 }
 
@@ -327,7 +327,7 @@ static void write_sum_page(struct f2fs_sb_info *sbi,
 }
 
 static unsigned int check_prefree_segments(struct f2fs_sb_info *sbi,
-					int log_ofs_unit, int type)
+					int ofs_unit, int type)
 {
 	struct dirty_seglist_info *dirty_i = DIRTY_I(sbi);
 	unsigned long *prefree_segmap = dirty_i->dirty_segmap[PRE];
@@ -349,20 +349,20 @@ static unsigned int check_prefree_segments(struct f2fs_sb_info *sbi,
 		return NULL_SEGNO;
 next:
 	segno = find_next_bit(prefree_segmap, TOTAL_SEGS(sbi), ofs++);
-	ofs = ((segno >> log_ofs_unit) << log_ofs_unit) + (1 << log_ofs_unit);
+	ofs = ((segno / ofs_unit) * ofs_unit) + ofs_unit;
 	if (segno < TOTAL_SEGS(sbi)) {
 		/* skip intermediate segments in a section */
-		if (segno % (1 << log_ofs_unit))
+		if (segno % ofs_unit)
 			goto next;
 
 		/* skip if whole section is not prefree */
 		next_segno = find_next_zero_bit(prefree_segmap,
 						TOTAL_SEGS(sbi), segno + 1);
-		if (next_segno - segno < (1 << log_ofs_unit))
+		if (next_segno - segno < ofs_unit)
 			goto next;
 
 		/* skip if whole section was not free at the last checkpoint */
-		for (i = 0; i < (1 << log_ofs_unit); i++)
+		for (i = 0; i < ofs_unit; i++)
 			if (get_seg_entry(sbi, segno)->ckpt_valid_blocks)
 				goto next;
 		return segno;
@@ -381,7 +381,7 @@ static void get_new_segment(struct f2fs_sb_info *sbi,
 	unsigned int total_secs = sbi->total_sections;
 	unsigned int segno, secno, zoneno;
 	unsigned int total_zones = sbi->total_sections / sbi->secs_per_zone;
-	unsigned int hint = *newseg >> sbi->log_segs_per_sec;
+	unsigned int hint = *newseg / sbi->segs_per_sec;
 	unsigned int old_zoneno = GET_ZONENO_FROM_SEGNO(sbi, *newseg);
 	unsigned int left_start = hint;
 	bool init = true;
@@ -424,9 +424,12 @@ find_other_zone:
 	secno = left_start;
 skip_left:
 	hint = secno;
-	segno = secno << sbi->log_segs_per_sec;
+	segno = secno * sbi->segs_per_sec;
 	zoneno = secno / sbi->secs_per_zone;
 
+	/* give up on finding another zone */
+	if (!init)
+		goto got_it;
 	if (sbi->secs_per_zone == 1)
 		goto got_it;
 	if (zoneno == old_zoneno)
@@ -437,15 +440,12 @@ skip_left:
 		if (go_left && zoneno == 0)
 			goto got_it;
 	}
+	for (i = 0; i < NR_CURSEG_TYPE; i++)
+		if (CURSEG_I(sbi, i)->zone == zoneno)
+			break;
 
-	for (i = 0; i < DEFAULT_CURSEGS; i++) {
-		struct curseg_info *curseg = CURSEG_I(sbi, i);
-
-		if (curseg->zone != zoneno)
-			continue;
-		if (!init)
-			continue;
-
+	if (i < NR_CURSEG_TYPE) {
+		/* zone is in user, try another */
 		if (go_left)
 			hint = zoneno * sbi->secs_per_zone - 1;
 		else if (zoneno + 1 >= total_zones)
@@ -574,15 +574,15 @@ static void allocate_segment_by_default(struct f2fs_sb_info *sbi,
 						int type, bool force)
 {
 	struct curseg_info *curseg = CURSEG_I(sbi, type);
-	unsigned int log_ofs_unit;
+	unsigned int ofs_unit;
 
 	if (force) {
 		new_curseg(sbi, type, true);
 		goto out;
 	}
 
-	log_ofs_unit = need_SSR(sbi) ? 0 : sbi->log_segs_per_sec;
-	curseg->next_segno = check_prefree_segments(sbi, log_ofs_unit, type);
+	ofs_unit = need_SSR(sbi) ? 1 : sbi->segs_per_sec;
+	curseg->next_segno = check_prefree_segments(sbi, ofs_unit, type);
 
 	if (curseg->next_segno != NULL_SEGNO)
 		change_curseg(sbi, type, false);
@@ -744,7 +744,32 @@ static bool __has_curseg_space(struct f2fs_sb_info *sbi, int type)
 	return false;
 }
 
-static int __get_segment_type(struct page *page, enum page_type p_type)
+static int __get_segment_type_2(struct page *page, enum page_type p_type)
+{
+	if (p_type == DATA)
+		return CURSEG_HOT_DATA;
+	else
+		return CURSEG_HOT_NODE;
+}
+
+static int __get_segment_type_4(struct page *page, enum page_type p_type)
+{
+	if (p_type == DATA) {
+		struct inode *inode = page->mapping->host;
+
+		if (S_ISDIR(inode->i_mode))
+			return CURSEG_HOT_DATA;
+		else
+			return CURSEG_COLD_DATA;
+	} else {
+		if (IS_DNODE(page) && !is_cold_node(page))
+			return CURSEG_HOT_NODE;
+		else
+			return CURSEG_COLD_NODE;
+	}
+}
+
+static int __get_segment_type_6(struct page *page, enum page_type p_type)
 {
 	if (p_type == DATA) {
 		struct inode *inode = page->mapping->host;
@@ -761,6 +786,21 @@ static int __get_segment_type(struct page *page, enum page_type p_type)
 						CURSEG_HOT_NODE;
 		else
 			return CURSEG_COLD_NODE;
+	}
+}
+
+static int __get_segment_type(struct page *page, enum page_type p_type)
+{
+	struct f2fs_sb_info *sbi = F2FS_SB(page->mapping->host->i_sb);
+	switch (sbi->active_logs) {
+	case 2:
+		return __get_segment_type_2(page, p_type);
+	case 4:
+		return __get_segment_type_4(page, p_type);
+	case 6:
+		return __get_segment_type_6(page, p_type);
+	default:
+		BUG();
 	}
 }
 
@@ -1375,7 +1415,7 @@ static int build_sit_info(struct f2fs_sb_info *sbi)
 			return -ENOMEM;
 	}
 
-	if (sbi->log_segs_per_sec) {
+	if (sbi->segs_per_sec > 1) {
 		sit_i->sec_entries = vzalloc(sbi->total_sections *
 					sizeof(struct sec_entry));
 		if (!sit_i->sec_entries)
@@ -1397,7 +1437,7 @@ static int build_sit_info(struct f2fs_sb_info *sbi)
 	/* init SIT information */
 	sit_i->s_ops = &default_salloc_ops;
 
-	sit_i->sit_base_addr = le64_to_cpu(raw_super->sit_blkaddr);
+	sit_i->sit_base_addr = le32_to_cpu(raw_super->sit_blkaddr);
 	sit_i->sit_blocks = sit_segs << sbi->log_blocks_per_seg;
 	sit_i->written_valid_blocks = le64_to_cpu(ckpt->valid_block_count);
 	sit_i->sit_bitmap = dst_bitmap;
@@ -1451,13 +1491,13 @@ static int build_curseg(struct f2fs_sb_info *sbi)
 	struct curseg_info *array = NULL;
 	int i;
 
-	array = kzalloc(sizeof(*array) * DEFAULT_CURSEGS, GFP_KERNEL);
+	array = kzalloc(sizeof(*array) * NR_CURSEG_TYPE, GFP_KERNEL);
 	if (!array)
 		return -ENOMEM;
 
 	SM_I(sbi)->curseg_array = array;
 
-	for (i = 0; i < DEFAULT_CURSEGS; i++) {
+	for (i = 0; i < NR_CURSEG_TYPE; i++) {
 		mutex_init(&array[i].curseg_mutex);
 		array[i].sum_blk = kzalloc(PAGE_CACHE_SIZE, GFP_KERNEL);
 		if (!array[i].sum_blk)
@@ -1498,7 +1538,7 @@ static void build_sit_entries(struct f2fs_sb_info *sbi)
 got_it:
 		check_block_count(sbi, start, &sit);
 		seg_info_from_raw_sit(se, &sit);
-		if (sbi->log_segs_per_sec) {
+		if (sbi->segs_per_sec > 1) {
 			struct sec_entry *e = get_sec_entry(sbi, start);
 			e->valid_blocks += se->valid_blocks;
 		}
@@ -1602,7 +1642,7 @@ static void init_min_max_mtime(struct f2fs_sb_info *sbi)
 		for (i = 0; i < sbi->segs_per_sec; i++)
 			mtime += get_seg_entry(sbi, segno + i)->mtime;
 
-		mtime = mtime >> sbi->log_segs_per_sec;
+		mtime = div_u64(mtime, sbi->segs_per_sec);
 
 		if (sit_i->min_mtime > mtime)
 			sit_i->min_mtime = mtime;
@@ -1625,14 +1665,14 @@ int build_segment_manager(struct f2fs_sb_info *sbi)
 	sbi->sm_info = sm_info;
 	INIT_LIST_HEAD(&sm_info->wblist_head);
 	spin_lock_init(&sm_info->wblist_lock);
-	sm_info->seg0_blkaddr = le64_to_cpu(raw_super->segment0_blkaddr);
-	sm_info->main_blkaddr = le64_to_cpu(raw_super->main_blkaddr);
+	sm_info->seg0_blkaddr = le32_to_cpu(raw_super->segment0_blkaddr);
+	sm_info->main_blkaddr = le32_to_cpu(raw_super->main_blkaddr);
 	sm_info->segment_count = le32_to_cpu(raw_super->segment_count);
 	sm_info->rsvd_segment_count =
 		le32_to_cpu(ckpt->rsvd_segment_count);
 	sm_info->main_segment_count =
 		le32_to_cpu(raw_super->segment_count_main);
-	sm_info->ssa_blkaddr = le64_to_cpu(raw_super->ssa_blkaddr);
+	sm_info->ssa_blkaddr = le32_to_cpu(raw_super->ssa_blkaddr);
 	sm_info->segment_count_ssa =
 		le32_to_cpu(raw_super->segment_count_ssa);
 
@@ -1704,7 +1744,7 @@ static void destroy_curseg(struct f2fs_sb_info *sbi)
 	if (!array)
 		return;
 	SM_I(sbi)->curseg_array = NULL;
-	for (i = 0; i < DEFAULT_CURSEGS; i++)
+	for (i = 0; i < NR_CURSEG_TYPE; i++)
 		kfree(array[i].sum_blk);
 	kfree(array);
 }
