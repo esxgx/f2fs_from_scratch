@@ -26,19 +26,18 @@ struct node_info {
 	nid_t ino;	/* inode number of the node's owner */
 	block_t	blk_addr;	/* block address of the node */
 	unsigned char version;	/* version of the node */
-} __packed;
+};
 
 static inline unsigned char inc_node_version(unsigned char version)
 {
-	(version == 255) ? version = 0 : ++version;
-	return version;
+	return ++version;
 }
 
 struct nat_entry {
-	struct node_info ni;
+	struct list_head list;	/* for clean or dirty nat list */
 	bool checkpointed;
-	struct list_head list;	/* clean/dirty list */
-} __packed;
+	struct node_info ni;
+};
 
 #define nat_get_nid(nat)		(nat->ni.nid)
 #define nat_set_nid(nat, n)		(nat->ni.nid = n)
@@ -151,7 +150,7 @@ static inline void fill_node_footer(struct page *page, nid_t nid,
 		memset(rn, 0, sizeof(*rn));
 	rn->footer.nid = cpu_to_le32(nid);
 	rn->footer.ino = cpu_to_le32(ino);
-	rn->footer.offset = cpu_to_le32(ofs);
+	rn->footer.flag = cpu_to_le32(ofs << OFFSET_BIT_SHIFT);
 }
 
 static inline void copy_node_footer(struct page *dst, struct page *src)
@@ -173,37 +172,6 @@ static inline void fill_node_footer_blkaddr(struct page *page, block_t blkaddr)
 	rn->footer.next_blkaddr = blkaddr;
 }
 
-static inline void set_next_scan_nid(struct f2fs_nm_info *nm_i, int nid)
-{
-	spin_lock(&nm_i->stat_lock);
-	nm_i->next_scan_nid = nid;
-	spin_unlock(&nm_i->stat_lock);
-}
-
-static inline nid_t get_next_scan_nid(struct f2fs_nm_info *nm_i)
-{
-	nid_t nid;
-	spin_lock(&nm_i->stat_lock);
-	nid = nm_i->next_scan_nid;
-	spin_unlock(&nm_i->stat_lock);
-	return nid;
-}
-
-static inline unsigned char is_fsync_dnode(struct page *node_page)
-{
-	void *kaddr = page_address(node_page);
-	struct f2fs_node *raw_node = (struct f2fs_node *)kaddr;
-	return raw_node->footer.fsync;
-}
-
-static inline unsigned char is_dent_dnode(struct page *node_page)
-{
-	void *kaddr = page_address(node_page);
-	struct f2fs_node *raw_node = (struct f2fs_node *)kaddr;
-	unsigned char dent = raw_node->footer.dentry;
-	return dent;
-}
-
 static inline nid_t ino_of_node(struct page *node_page)
 {
 	void *kaddr = page_address(node_page);
@@ -222,7 +190,8 @@ static inline unsigned int ofs_of_node(struct page *node_page)
 {
 	void *kaddr = page_address(node_page);
 	struct f2fs_node *rn = (struct f2fs_node *)kaddr;
-	return le32_to_cpu(rn->footer.offset);
+	unsigned flag = le32_to_cpu(rn->footer.flag);
+	return flag >> OFFSET_BIT_SHIFT;
 }
 
 static inline unsigned long long cpver_of_node(struct page *node_page)
@@ -282,7 +251,7 @@ static inline nid_t get_nid(struct page *p, int off, bool i)
  */
 static inline int is_cold_file(struct inode *inode)
 {
-	return F2FS_I(inode)->is_cold;
+	return F2FS_I(inode)->i_advise & FADVISE_COLD_BIT;
 }
 
 static inline int is_cold_data(struct page *page)
@@ -304,28 +273,58 @@ static inline int is_cold_node(struct page *page)
 {
 	void *kaddr = page_address(page);
 	struct f2fs_node *rn = (struct f2fs_node *)kaddr;
-	return rn->footer.cold;
+	unsigned int flag = le32_to_cpu(rn->footer.flag);
+	return flag & (0x1 << COLD_BIT_SHIFT);
+}
+
+static inline unsigned char is_fsync_dnode(struct page *page)
+{
+	void *kaddr = page_address(page);
+	struct f2fs_node *rn = (struct f2fs_node *)kaddr;
+	unsigned int flag = le32_to_cpu(rn->footer.flag);
+	return flag & (0x1 << FSYNC_BIT_SHIFT);
+}
+
+static inline unsigned char is_dent_dnode(struct page *page)
+{
+	void *kaddr = page_address(page);
+	struct f2fs_node *rn = (struct f2fs_node *)kaddr;
+	unsigned int flag = le32_to_cpu(rn->footer.flag);
+	return flag & (0x1 << DENT_BIT_SHIFT);
 }
 
 static inline void set_cold_node(struct inode *inode, struct page *page)
 {
 	struct f2fs_node *rn = (struct f2fs_node *)page_address(page);
+	unsigned int flag = le32_to_cpu(rn->footer.flag);
+
 	if (S_ISDIR(inode->i_mode))
-		rn->footer.cold = 0;
+		flag &= ~(0x1 << COLD_BIT_SHIFT);
 	else
-		rn->footer.cold = 1;
+		flag |= (0x1 << COLD_BIT_SHIFT);
+	rn->footer.flag = cpu_to_le32(flag);
 }
 
 static inline void set_fsync_mark(struct page *page, int mark)
 {
 	void *kaddr = page_address(page);
 	struct f2fs_node *rn = (struct f2fs_node *)kaddr;
-	rn->footer.fsync = mark;
+	unsigned int flag = le32_to_cpu(rn->footer.flag);
+	if (mark)
+		flag |= (0x1 << FSYNC_BIT_SHIFT);
+	else
+		flag &= ~(0x1 << FSYNC_BIT_SHIFT);
+	rn->footer.flag = cpu_to_le32(flag);
 }
 
 static inline void set_dentry_mark(struct page *page, int mark)
 {
 	void *kaddr = page_address(page);
 	struct f2fs_node *rn = (struct f2fs_node *)kaddr;
-	rn->footer.dentry = mark;
+	unsigned int flag = le32_to_cpu(rn->footer.flag);
+	if (mark)
+		flag |= (0x1 << DENT_BIT_SHIFT);
+	else
+		flag &= ~(0x1 << DENT_BIT_SHIFT);
+	rn->footer.flag = cpu_to_le32(flag);
 }

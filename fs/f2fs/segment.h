@@ -9,7 +9,6 @@
  * published by the Free Software Foundation.
  */
 /* constant macro */
-#define DEFAULT_CURSEGS			(6)
 #define NULL_SEGNO			((unsigned int)(~0))
 #define SUM_TYPE_NODE			(1)
 #define SUM_TYPE_DATA			(0)
@@ -35,18 +34,18 @@
 	 (segno == CURSEG_I(sbi, CURSEG_COLD_NODE)->segno))
 
 #define IS_CURSEC(sbi, secno)						\
-	((secno == CURSEG_I(sbi, CURSEG_HOT_DATA)->segno >>		\
-	  sbi->log_segs_per_sec) ||	\
-	 (secno == CURSEG_I(sbi, CURSEG_WARM_DATA)->segno >>		\
-	  sbi->log_segs_per_sec) ||	\
-	 (secno == CURSEG_I(sbi, CURSEG_COLD_DATA)->segno >>		\
-	  sbi->log_segs_per_sec) ||	\
-	 (secno == CURSEG_I(sbi, CURSEG_HOT_NODE)->segno >>		\
-	  sbi->log_segs_per_sec) ||	\
-	 (secno == CURSEG_I(sbi, CURSEG_WARM_NODE)->segno >>		\
-	  sbi->log_segs_per_sec) ||	\
-	 (secno == CURSEG_I(sbi, CURSEG_COLD_NODE)->segno >>		\
-	  sbi->log_segs_per_sec))	\
+	((secno == CURSEG_I(sbi, CURSEG_HOT_DATA)->segno /		\
+	  sbi->segs_per_sec) ||	\
+	 (secno == CURSEG_I(sbi, CURSEG_WARM_DATA)->segno /		\
+	  sbi->segs_per_sec) ||	\
+	 (secno == CURSEG_I(sbi, CURSEG_COLD_DATA)->segno /		\
+	  sbi->segs_per_sec) ||	\
+	 (secno == CURSEG_I(sbi, CURSEG_HOT_NODE)->segno /		\
+	  sbi->segs_per_sec) ||	\
+	 (secno == CURSEG_I(sbi, CURSEG_WARM_NODE)->segno /		\
+	  sbi->segs_per_sec) ||	\
+	 (secno == CURSEG_I(sbi, CURSEG_COLD_NODE)->segno /		\
+	  sbi->segs_per_sec))	\
 
 #define START_BLOCK(sbi, segno)						\
 	(SM_I(sbi)->seg0_blkaddr +					\
@@ -65,9 +64,9 @@
 	NULL_SEGNO : GET_L2R_SEGNO(FREE_I(sbi),			\
 		GET_SEGNO_FROM_SEG0(sbi, blk_addr)))
 #define GET_SECNO(sbi, segno)					\
-	((segno) >> sbi->log_segs_per_sec)
+	((segno) / sbi->segs_per_sec)
 #define GET_ZONENO_FROM_SEGNO(sbi, segno)				\
-	((segno >> sbi->log_segs_per_sec) / sbi->secs_per_zone)
+	((segno / sbi->segs_per_sec) / sbi->secs_per_zone)
 
 #define GET_SUM_BLOCK(sbi, segno)				\
 	((sbi->sm_info->ssa_blkaddr) + segno)
@@ -129,7 +128,7 @@ struct victim_sel_policy {
 	int type;
 	unsigned long *dirty_segmap;
 	unsigned int offset;
-	unsigned int log_ofs_unit;
+	unsigned int ofs_unit;
 	unsigned int min_cost;
 	unsigned int min_segno;
 };
@@ -249,7 +248,7 @@ static inline struct sec_entry *get_sec_entry(struct f2fs_sb_info *sbi,
 static inline unsigned int get_valid_blocks(struct f2fs_sb_info *sbi,
 				unsigned int segno, int section)
 {
-	if (section)
+	if (section > 1)
 		return get_sec_entry(sbi, segno)->valid_blocks;
 	else
 		return get_seg_entry(sbi, segno)->valid_blocks;
@@ -290,8 +289,8 @@ static inline unsigned int find_next_inuse(struct free_segmap_info *free_i,
 static inline void __set_free(struct f2fs_sb_info *sbi, unsigned int segno)
 {
 	struct free_segmap_info *free_i = FREE_I(sbi);
-	unsigned int secno = segno >> sbi->log_segs_per_sec;
-	unsigned int start_segno = secno << sbi->log_segs_per_sec;
+	unsigned int secno = segno / sbi->segs_per_sec;
+	unsigned int start_segno = secno * sbi->segs_per_sec;
 	unsigned int next;
 
 	write_lock(&free_i->segmap_lock);
@@ -310,7 +309,7 @@ static inline void __set_inuse(struct f2fs_sb_info *sbi,
 		unsigned int segno)
 {
 	struct free_segmap_info *free_i = FREE_I(sbi);
-	unsigned int secno = segno >> sbi->log_segs_per_sec;
+	unsigned int secno = segno / sbi->segs_per_sec;
 	set_bit(segno, free_i->free_segmap);
 	free_i->free_segments--;
 	if (!test_and_set_bit(secno, free_i->free_secmap))
@@ -321,8 +320,8 @@ static inline void __set_test_and_free(struct f2fs_sb_info *sbi,
 		unsigned int segno)
 {
 	struct free_segmap_info *free_i = FREE_I(sbi);
-	unsigned int secno = segno >> sbi->log_segs_per_sec;
-	unsigned int start_segno = secno << sbi->log_segs_per_sec;
+	unsigned int secno = segno / sbi->segs_per_sec;
+	unsigned int start_segno = secno * sbi->segs_per_sec;
 	unsigned int next;
 
 	write_lock(&free_i->segmap_lock);
@@ -343,7 +342,7 @@ static inline void __set_test_and_inuse(struct f2fs_sb_info *sbi,
 		unsigned int segno)
 {
 	struct free_segmap_info *free_i = FREE_I(sbi);
-	unsigned int secno = segno >> sbi->log_segs_per_sec;
+	unsigned int secno = segno / sbi->segs_per_sec;
 	write_lock(&free_i->segmap_lock);
 	if (!test_and_set_bit(segno, free_i->free_segmap)) {
 		free_i->free_segments--;
@@ -426,15 +425,13 @@ static inline int overprovision_segments(struct f2fs_sb_info *sbi)
 static inline int overprovision_sections(struct f2fs_sb_info *sbi)
 {
 	struct f2fs_gc_info *gc_i = sbi->gc_info;
-	return ((unsigned int) gc_i->overp_segment_count)
-						>> sbi->log_segs_per_sec;
+	return ((unsigned int) gc_i->overp_segment_count) / sbi->segs_per_sec;
 }
 
 static inline int reserved_sections(struct f2fs_sb_info *sbi)
 {
 	struct f2fs_gc_info *gc_i = sbi->gc_info;
-	return ((unsigned int) gc_i->rsvd_segment_count)
-						>> sbi->log_segs_per_sec;
+	return ((unsigned int) gc_i->rsvd_segment_count) / sbi->segs_per_sec;
 }
 
 static inline bool need_SSR(struct f2fs_sb_info *sbi)
@@ -469,32 +466,20 @@ static inline unsigned int curseg_segno(struct f2fs_sb_info *sbi,
 		int type)
 {
 	struct curseg_info *curseg = CURSEG_I(sbi, type);
-	unsigned int segno;
-	mutex_lock(&curseg->curseg_mutex);
-	segno = curseg->segno;
-	mutex_unlock(&curseg->curseg_mutex);
-	return segno;
+	return curseg->segno;
 }
 
 static inline unsigned char curseg_alloc_type(struct f2fs_sb_info *sbi,
 		int type)
 {
 	struct curseg_info *curseg = CURSEG_I(sbi, type);
-	unsigned char a_type;
-	mutex_lock(&curseg->curseg_mutex);
-	a_type = curseg->alloc_type;
-	mutex_unlock(&curseg->curseg_mutex);
-	return a_type;
+	return curseg->alloc_type;
 }
 
 static inline unsigned short curseg_blkoff(struct f2fs_sb_info *sbi, int type)
 {
 	struct curseg_info *curseg = CURSEG_I(sbi, type);
-	unsigned short blkoff;
-	mutex_lock(&curseg->curseg_mutex);
-	blkoff = curseg->next_blkoff;
-	mutex_unlock(&curseg->curseg_mutex);
-	return blkoff;
+	return curseg->next_blkoff;
 }
 
 static inline void check_seg_range(struct f2fs_sb_info *sbi, unsigned int segno)
@@ -578,24 +563,6 @@ static inline void set_to_next_sit(struct sit_info *sit_i, unsigned int start)
 		f2fs_clear_bit(block_off, sit_i->sit_bitmap);
 	else
 		f2fs_set_bit(block_off, sit_i->sit_bitmap);
-}
-
-static inline uint64_t div64_64(uint64_t dividend, uint64_t divisor)
-{
-	uint32_t d = divisor;
-
-	if (divisor > 0xffffffffUll) {
-		unsigned int shift = fls(divisor >> 32);
-		d = divisor >> shift;
-		dividend >>= shift;
-	}
-
-	if (dividend >> 32)
-		do_div(dividend, d);
-	else
-		dividend = (uint32_t) dividend / d;
-
-	return dividend;
 }
 
 static inline unsigned long long get_mtime(struct f2fs_sb_info *sbi)

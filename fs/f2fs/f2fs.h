@@ -27,6 +27,7 @@
 #define F2FS_MOUNT_NOHEAP		0x00000008
 #define F2FS_MOUNT_XATTR_USER		0x00000010
 #define F2FS_MOUNT_POSIX_ACL		0x00000020
+#define F2FS_MOUNT_DISABLE_EXT_IDENTIFY	0x00000040
 
 #define clear_opt(sbi, option)	(sbi->mount_opt.opt &= ~F2FS_MOUNT_##option)
 #define set_opt(sbi, option)	(sbi->mount_opt.opt |= F2FS_MOUNT_##option)
@@ -109,6 +110,7 @@ static inline int update_sits_in_cursum(struct f2fs_summary_block *rs, int i)
  */
 #define XATTR_NODE_OFFSET	(-1)
 #define RDONLY_NODE		1
+#define F2FS_LINK_MAX		32000
 
 struct extent_info {
 	rwlock_t ext_lock;
@@ -117,6 +119,10 @@ struct extent_info {
 	unsigned int len;
 };
 
+#define FADVISE_COLD_BIT	0x01
+/*
+ * i_advise uses FADVISE_XXX_BIT. We can add additional hints later.
+ */
 struct f2fs_inode_info {
 	struct inode vfs_inode;
 	unsigned long i_flags;
@@ -129,7 +135,7 @@ struct f2fs_inode_info {
 	nid_t i_xattr_nid;
 	struct extent_info ext;
 	umode_t i_acl_mode;
-	unsigned char is_cold;		/* If true, this is cold data */
+	unsigned char i_advise;		/* If true, this is cold data */
 };
 
 static inline void get_extent_info(struct extent_info *ext,
@@ -157,8 +163,7 @@ struct f2fs_nm_info {
 	unsigned int nat_segs;		/* the number of nat segments */
 	unsigned int nat_blocks;	/* the number of nat blocks of
 					   one size */
-	nid_t max_nid;		/* */
-
+	nid_t max_nid;
 	unsigned int nat_cnt;		/* the number of nodes in NAT Buffer */
 	struct radix_tree_root nat_root;
 	rwlock_t nat_tree_lock;		/* Protect nat_tree_lock */
@@ -167,13 +172,9 @@ struct f2fs_nm_info {
 
 	unsigned int fcnt;		/* the number of free node id */
 	struct mutex build_lock;	/* lock for build free nids */
-	struct list_head free_nid_list;	/* free node list */
-	spinlock_t free_nid_list_lock;	/* Protect pre-free nid list */
-
-	spinlock_t stat_lock;		/* Protect status variables */
 
 	int nat_upd_blkoff[3];		/* Block offset
-					   in current journal segment
+					   in the current journal segment
 					   where the last NAT update happened */
 	int lst_upd_blkoff[3];		/* Block offset
 					   in current journal segment */
@@ -183,8 +184,10 @@ struct f2fs_nm_info {
 	char *nat_bitmap;		/* NAT bitmap pointer */
 	int bitmap_size;		/* bitmap size */
 
-	nid_t init_scan_nid;	/* the first nid to be scanned */
-	nid_t next_scan_nid;	/* the next nid to be scanned */
+	nid_t init_scan_nid;		/* the first nid to be scanned */
+	nid_t next_scan_nid;		/* the next nid to be scanned */
+	struct list_head free_nid_list;
+	spinlock_t free_nid_list_lock;	/* Protect free nid list */
 };
 
 struct dnode_of_data {
@@ -193,7 +196,7 @@ struct dnode_of_data {
 	struct page *node_page;
 	nid_t nid;
 	unsigned int ofs_in_node;
-	int ilock;
+	bool inode_page_locked;
 	block_t	data_blkaddr;
 };
 
@@ -204,7 +207,7 @@ static inline void set_new_dnode(struct dnode_of_data *dn, struct inode *inode,
 	dn->inode_page = ipage;
 	dn->node_page = npage;
 	dn->nid = nid;
-	dn->ilock = 0;
+	dn->inode_page_locked = 0;
 }
 
 /**
@@ -348,7 +351,6 @@ struct f2fs_sb_info {
 	unsigned int meta_ino_num;		/* Root Inode Number*/
 	unsigned int log_blocks_per_seg;
 	unsigned int blocks_per_seg;
-	unsigned int log_segs_per_sec;
 	unsigned int segs_per_sec;
 	unsigned int secs_per_zone;
 	unsigned int total_sections;
@@ -358,6 +360,7 @@ struct f2fs_sb_info {
 	unsigned int segment_count[2];
 	unsigned int block_count[2];
 	unsigned int last_victim[2];
+	int active_logs;
 	block_t user_block_count;
 	block_t total_valid_block_count;
 	block_t alloc_valid_block_count;
@@ -394,8 +397,6 @@ struct f2fs_sb_info {
 	struct bio *bio[NR_PAGE_TYPE];
 	sector_t last_block_in_bio[NR_PAGE_TYPE];
 	struct rw_semaphore bio_sem;
-	void *ckpt_mutex;			/* mutex protecting
-						   node buffer */
 	spinlock_t stat_lock;			/* lock for handling the number
 						   of valid blocks and
 						   valid nodes */
