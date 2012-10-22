@@ -27,12 +27,14 @@
 #define F2FS_XATTR_REFCOUNT_MAX         1024
 
 /* Name indexes */
-#define F2FS_XATTR_INDEX_USER                   1
-#define F2FS_XATTR_INDEX_POSIX_ACL_ACCESS       2
-#define F2FS_XATTR_INDEX_POSIX_ACL_DEFAULT      3
-#define F2FS_XATTR_INDEX_TRUSTED                4
-#define F2FS_XATTR_INDEX_LUSTRE                 5
-#define F2FS_XATTR_INDEX_SECURITY               6
+#define F2FS_SYSTEM_ADVISE_PREFIX		"system.advise"
+#define F2FS_XATTR_INDEX_USER			1
+#define F2FS_XATTR_INDEX_POSIX_ACL_ACCESS	2
+#define F2FS_XATTR_INDEX_POSIX_ACL_DEFAULT	3
+#define F2FS_XATTR_INDEX_TRUSTED		4
+#define F2FS_XATTR_INDEX_LUSTRE			5
+#define F2FS_XATTR_INDEX_SECURITY		6
+#define F2FS_XATTR_INDEX_ADVISE			7
 
 struct f2fs_xattr_header {
 	__le32  h_magic;        /* magic number for identification */
@@ -109,6 +111,7 @@ extern const struct xattr_handler f2fs_xattr_user_handler;
 extern const struct xattr_handler f2fs_xattr_trusted_handler;
 extern const struct xattr_handler f2fs_xattr_acl_access_handler;
 extern const struct xattr_handler f2fs_xattr_acl_default_handler;
+extern const struct xattr_handler f2fs_xattr_advise_handler;
 
 extern const struct xattr_handler *f2fs_xattr_handlers[];
 

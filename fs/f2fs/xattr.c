@@ -103,28 +103,29 @@ static int f2fs_xattr_generic_set(struct dentry *dentry, const char *name,
 }
 
 const struct xattr_handler f2fs_xattr_user_handler = {
-	.prefix = XATTR_USER_PREFIX,
+	.prefix	= XATTR_USER_PREFIX,
 	.flags	= F2FS_XATTR_INDEX_USER,
-	.list   = f2fs_xattr_generic_list,
-	.get    = f2fs_xattr_generic_get,
-	.set    = f2fs_xattr_generic_set,
+	.list	= f2fs_xattr_generic_list,
+	.get	= f2fs_xattr_generic_get,
+	.set	= f2fs_xattr_generic_set,
 };
 
 const struct xattr_handler f2fs_xattr_trusted_handler = {
-	.prefix = XATTR_TRUSTED_PREFIX,
+	.prefix	= XATTR_TRUSTED_PREFIX,
 	.flags	= F2FS_XATTR_INDEX_TRUSTED,
-	.list   = f2fs_xattr_generic_list,
-	.get    = f2fs_xattr_generic_get,
-	.set    = f2fs_xattr_generic_set,
+	.list	= f2fs_xattr_generic_list,
+	.get	= f2fs_xattr_generic_get,
+	.set	= f2fs_xattr_generic_set,
 };
 
 static const struct xattr_handler *f2fs_xattr_handler_map[] = {
-	[F2FS_XATTR_INDEX_USER]              = &f2fs_xattr_user_handler,
+	[F2FS_XATTR_INDEX_USER] = &f2fs_xattr_user_handler,
 #ifdef CONFIG_F2FS_FS_POSIX_ACL
-	[F2FS_XATTR_INDEX_POSIX_ACL_ACCESS]  = &f2fs_xattr_acl_access_handler,
+	[F2FS_XATTR_INDEX_POSIX_ACL_ACCESS] = &f2fs_xattr_acl_access_handler,
 	[F2FS_XATTR_INDEX_POSIX_ACL_DEFAULT] = &f2fs_xattr_acl_default_handler,
 #endif
-	[F2FS_XATTR_INDEX_TRUSTED]           = &f2fs_xattr_trusted_handler,
+	[F2FS_XATTR_INDEX_TRUSTED] = &f2fs_xattr_trusted_handler,
+	[F2FS_XATTR_INDEX_ADVISE] = &f2fs_xattr_advise_handler,
 };
 
 const struct xattr_handler *f2fs_xattr_handlers[] = {
@@ -134,6 +135,7 @@ const struct xattr_handler *f2fs_xattr_handlers[] = {
 	&f2fs_xattr_acl_default_handler,
 #endif
 	&f2fs_xattr_trusted_handler,
+	&f2fs_xattr_advise_handler,
 	NULL,
 };
 
@@ -373,7 +375,7 @@ int f2fs_setxattr(struct inode *inode, int name_index, const char *name,
 
 	if (is_inode_flag_set(fi, FI_ACL_MODE)) {
 		inode->i_mode = fi->i_acl_mode;
-		inode->i_ctime = CURRENT_TIME_SEC;
+		inode->i_ctime = CURRENT_TIME;
 		clear_inode_flag(fi, FI_ACL_MODE);
 	}
 	f2fs_write_inode(inode, NULL);

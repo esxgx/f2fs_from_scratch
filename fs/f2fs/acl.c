@@ -78,12 +78,6 @@ static struct posix_acl *f2fs_acl_from_disk(const char *value, size_t size)
 		acl->a_entries[i].e_perm = le16_to_cpu(entry->e_perm);
 
 		switch (acl->a_entries[i].e_tag) {
-		case ACL_USER:
-		case ACL_GROUP:
-			acl->a_entries[i].e_id = le32_to_cpu(entry->e_id);
-			entry = (struct f2fs_acl_entry *)((char *)entry +
-					sizeof(struct f2fs_acl_entry));
-			break;
 		case ACL_USER_OBJ:
 		case ACL_GROUP_OBJ:
 		case ACL_MASK:
@@ -91,6 +85,21 @@ static struct posix_acl *f2fs_acl_from_disk(const char *value, size_t size)
 			acl->a_entries[i].e_id = ACL_UNDEFINED_ID;
 			entry = (struct f2fs_acl_entry *)((char *)entry +
 					sizeof(struct f2fs_acl_entry_short));
+			break;
+
+		case ACL_USER:
+			acl->a_entries[i].e_uid =
+				make_kuid(&init_user_ns,
+						le32_to_cpu(entry->e_id));
+			entry = (struct f2fs_acl_entry *)((char *)entry +
+					sizeof(struct f2fs_acl_entry));
+			break;
+		case ACL_GROUP:
+			acl->a_entries[i].e_gid =
+				make_kgid(&init_user_ns,
+						le32_to_cpu(entry->e_id));
+			entry = (struct f2fs_acl_entry *)((char *)entry +
+					sizeof(struct f2fs_acl_entry));
 			break;
 		default:
 			goto fail;
@@ -125,8 +134,16 @@ static void *f2fs_acl_to_disk(const struct posix_acl *acl, size_t *size)
 
 		switch (acl->a_entries[i].e_tag) {
 		case ACL_USER:
+			entry->e_id = cpu_to_le32(
+					from_kuid(&init_user_ns,
+						acl->a_entries[i].e_uid));
+			entry = (struct f2fs_acl_entry *)((char *)entry +
+					sizeof(struct f2fs_acl_entry));
+			break;
 		case ACL_GROUP:
-			entry->e_id = cpu_to_le32(acl->a_entries[i].e_id);
+			entry->e_id = cpu_to_le32(
+					from_kgid(&init_user_ns,
+						acl->a_entries[i].e_gid));
 			entry = (struct f2fs_acl_entry *)((char *)entry +
 					sizeof(struct f2fs_acl_entry));
 			break;
@@ -326,23 +343,20 @@ static int f2fs_xattr_get_acl(struct dentry *dentry, const char *name,
 		void *buffer, size_t size, int type)
 {
 	struct f2fs_sb_info *sbi = F2FS_SB(dentry->d_sb);
-	struct inode *inode = dentry->d_inode;
 	struct posix_acl *acl;
 	int error;
 
+	if (strcmp(name, "") != 0)
+		return -EINVAL;
 	if (!test_opt(sbi, POSIX_ACL))
 		return -EOPNOTSUPP;
 
-	if (strcmp(name, "") != 0)
-		return -EINVAL;
-
-	acl = f2fs_get_acl(inode, type);
+	acl = f2fs_get_acl(dentry->d_inode, type);
 	if (IS_ERR(acl))
 		return PTR_ERR(acl);
 	if (!acl)
 		return -ENODATA;
-
-	error = posix_acl_to_xattr(acl, buffer, size);
+	error = posix_acl_to_xattr(&init_user_ns, acl, buffer, size);
 	posix_acl_release(acl);
 
 	return error;
@@ -356,17 +370,15 @@ static int f2fs_xattr_set_acl(struct dentry *dentry, const char *name,
 	struct posix_acl *acl = NULL;
 	int error;
 
-	if (!test_opt(sbi, POSIX_ACL))
-		return -EOPNOTSUPP;
-
 	if (strcmp(name, "") != 0)
 		return -EINVAL;
-
+	if (!test_opt(sbi, POSIX_ACL))
+		return -EOPNOTSUPP;
 	if (!inode_owner_or_capable(inode))
 		return -EPERM;
 
 	if (value) {
-		acl = posix_acl_from_xattr(value, size);
+		acl = posix_acl_from_xattr(&init_user_ns, value, size);
 		if (IS_ERR(acl))
 			return PTR_ERR(acl);
 		if (acl) {
@@ -399,4 +411,55 @@ const struct xattr_handler f2fs_xattr_acl_access_handler = {
 	.list = f2fs_xattr_list_acl,
 	.get = f2fs_xattr_get_acl,
 	.set = f2fs_xattr_set_acl,
+};
+
+static size_t f2fs_xattr_advise_list(struct dentry *dentry, char *list,
+		size_t list_size, const char *name, size_t name_len, int type)
+{
+	const char *xname = F2FS_SYSTEM_ADVISE_PREFIX;
+	size_t size;
+
+	if (type != F2FS_XATTR_INDEX_ADVISE)
+		return 0;
+
+	size = strlen(xname) + 1;
+	if (list && size <= list_size)
+		memcpy(list, xname, size);
+	return size;
+}
+
+static int f2fs_xattr_advise_get(struct dentry *dentry, const char *name,
+		void *buffer, size_t size, int type)
+{
+	struct inode *inode = dentry->d_inode;
+
+	if (strcmp(name, "") != 0)
+		return -EINVAL;
+
+	*((char *)buffer) = F2FS_I(inode)->i_advise;
+	return sizeof(char);
+}
+
+static int f2fs_xattr_advise_set(struct dentry *dentry, const char *name,
+		const void *value, size_t size, int flags, int type)
+{
+	struct inode *inode = dentry->d_inode;
+
+	if (strcmp(name, "") != 0)
+		return -EINVAL;
+	if (!inode_owner_or_capable(inode))
+		return -EPERM;
+	if (value == NULL)
+		return -EINVAL;
+
+	F2FS_I(inode)->i_advise |= *(char *)value;
+	return 0;
+}
+
+const struct xattr_handler f2fs_xattr_advise_handler = {
+	.prefix = F2FS_SYSTEM_ADVISE_PREFIX,
+	.flags	= F2FS_XATTR_INDEX_ADVISE,
+	.list   = f2fs_xattr_advise_list,
+	.get    = f2fs_xattr_advise_get,
+	.set    = f2fs_xattr_advise_set,
 };
