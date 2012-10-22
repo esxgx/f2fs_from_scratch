@@ -87,23 +87,25 @@ static int do_read_inode(struct inode *inode)
 	ri = &(rn->i);
 
 	inode->i_mode = le16_to_cpu(ri->i_mode);
-	inode->i_uid = le32_to_cpu(ri->i_uid);
-	inode->i_gid = le32_to_cpu(ri->i_gid);
+	i_uid_write(inode, le32_to_cpu(ri->i_uid));
+	i_gid_write(inode, le32_to_cpu(ri->i_gid));
 	set_nlink(inode, le32_to_cpu(ri->i_links));
 	inode->i_size = le64_to_cpu(ri->i_size);
 	inode->i_blocks = le64_to_cpu(ri->i_blocks);
 
-	inode->i_atime.tv_sec = le32_to_cpu(ri->i_atime);
-	inode->i_ctime.tv_sec = le32_to_cpu(ri->i_ctime);
-	inode->i_mtime.tv_sec = le32_to_cpu(ri->i_mtime);
-	inode->i_atime.tv_nsec = 0;
-	inode->i_ctime.tv_nsec = 0;
-	inode->i_mtime.tv_nsec = 0;
+	inode->i_atime.tv_sec = le64_to_cpu(ri->i_mtime);
+	inode->i_ctime.tv_sec = le64_to_cpu(ri->i_ctime);
+	inode->i_mtime.tv_sec = le64_to_cpu(ri->i_mtime);
+	inode->i_atime.tv_nsec = le32_to_cpu(ri->i_mtime_nsec);
+	inode->i_ctime.tv_nsec = le32_to_cpu(ri->i_ctime_nsec);
+	inode->i_mtime.tv_nsec = le32_to_cpu(ri->i_mtime_nsec);
+
 	fi->current_depth = le32_to_cpu(ri->current_depth);
 	fi->i_xattr_nid = le32_to_cpu(ri->i_xattr_nid);
 	fi->i_flags = le32_to_cpu(ri->i_flags);
 	fi->flags = 0;
 	fi->data_version = le64_to_cpu(F2FS_CKPT(sbi)->checkpoint_ver) - 1;
+	fi->i_advise = ri->i_advise;
 	get_extent_info(&fi->ext, ri->i_ext);
 	f2fs_put_page(node_page, 1);
 	return 0;
@@ -180,16 +182,18 @@ void update_inode(struct inode *inode, struct page *node_page)
 	ri = &(rn->i);
 
 	ri->i_mode = cpu_to_le16(inode->i_mode);
-	ri->i_uid = cpu_to_le32(inode->i_uid);
-	ri->i_gid = cpu_to_le32(inode->i_gid);
+	ri->i_advise = F2FS_I(inode)->i_advise;
+	ri->i_uid = cpu_to_le32(i_uid_read(inode));
+	ri->i_gid = cpu_to_le32(i_gid_read(inode));
 	ri->i_links = cpu_to_le32(inode->i_nlink);
 	ri->i_size = cpu_to_le64(i_size_read(inode));
 	ri->i_blocks = cpu_to_le64(inode->i_blocks);
 	set_raw_extent(&F2FS_I(inode)->ext, &ri->i_ext);
 
-	ri->i_ctime = cpu_to_le32(inode->i_ctime.tv_sec);
-	ri->i_mtime = cpu_to_le32(inode->i_mtime.tv_sec);
-	ri->i_atime = cpu_to_le32(inode->i_atime.tv_sec);
+	ri->i_ctime = cpu_to_le64(inode->i_ctime.tv_sec);
+	ri->i_mtime = cpu_to_le64(inode->i_mtime.tv_sec);
+	ri->i_ctime_nsec = cpu_to_le32(inode->i_ctime.tv_nsec);
+	ri->i_mtime_nsec = cpu_to_le32(inode->i_mtime.tv_nsec);
 	ri->current_depth = cpu_to_le32(F2FS_I(inode)->current_depth);
 	ri->i_xattr_nid = cpu_to_le32(F2FS_I(inode)->i_xattr_nid);
 	ri->i_flags = cpu_to_le32(F2FS_I(inode)->i_flags);
