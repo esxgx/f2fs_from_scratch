@@ -35,6 +35,8 @@ enum {
 	Opt_noheap,
 	Opt_nouser_xattr,
 	Opt_noacl,
+	Opt_active_logs,
+	Opt_disable_ext_identify,
 	Opt_err,
 };
 
@@ -45,6 +47,8 @@ static match_table_t f2fs_tokens = {
 	{Opt_noheap, "no_heap"},
 	{Opt_nouser_xattr, "nouser_xattr"},
 	{Opt_noacl, "noacl"},
+	{Opt_active_logs, "active_logs=%u"},
+	{Opt_disable_ext_identify, "disable_ext_identify"},
 	{Opt_err, NULL},
 };
 
@@ -70,7 +74,7 @@ static struct inode *f2fs_alloc_inode(struct super_block *sb)
 	fi->vfs_inode.i_version = 1;
 	atomic_set(&fi->dirty_dents, 0);
 	fi->current_depth = 1;
-	fi->is_cold = 0;
+	fi->i_advise = 0;
 	rwlock_init(&fi->ext.ext_lock);
 
 	set_inode_flag(fi, FI_NEW_INODE);
@@ -140,7 +144,7 @@ static int f2fs_statfs(struct dentry *dentry, struct kstatfs *buf)
 
 	total_count = le64_to_cpu(sbi->raw_super->block_count);
 	user_block_count = sbi->user_block_count;
-	start_count = le64_to_cpu(sbi->raw_super->segment0_blkaddr);
+	start_count = le32_to_cpu(sbi->raw_super->segment0_blkaddr);
 	ovp_count = sbi->gc_info->overp_segment_count
 					<< sbi->log_blocks_per_seg;
 	buf->f_type = F2FS_SUPER_MAGIC;
@@ -184,6 +188,11 @@ static int f2fs_show_options(struct seq_file *seq, struct dentry *root)
 	else
 		seq_puts(seq, ",noacl");
 #endif
+	if (test_opt(sbi, DISABLE_EXT_IDENTIFY))
+		seq_puts(seq, ",disable_ext_indentify");
+
+	seq_printf(seq, ",active_logs=%u", sbi->active_logs);
+
 	return 0;
 }
 
@@ -202,6 +211,7 @@ static int parse_options(struct f2fs_sb_info *sbi, char *options)
 {
 	substring_t args[MAX_OPT_ARGS];
 	char *p;
+	int arg = 0;
 
 	if (!options)
 		return 0;
@@ -210,7 +220,13 @@ static int parse_options(struct f2fs_sb_info *sbi, char *options)
 		int token;
 		if (!*p)
 			continue;
+		/*
+		 * Initialize args struct so we know whether arg was
+		 * found; some options take optional arguments.
+		 */
+		args[0].to = args[0].from = NULL;
 		token = match_token(p, f2fs_tokens, args);
+
 		switch (token) {
 		case Opt_gc_background_off:
 			clear_opt(sbi, BG_GC);
@@ -242,6 +258,16 @@ static int parse_options(struct f2fs_sb_info *sbi, char *options)
 			pr_info("noacl options not supported\n");
 			break;
 #endif
+		case Opt_active_logs:
+			if (args->from && match_int(args, &arg))
+				return -EINVAL;
+			if (arg != 2 && arg != 4 && arg != 6)
+				return -EINVAL;
+			sbi->active_logs = arg;
+			break;
+		case Opt_disable_ext_identify:
+			set_opt(sbi, DISABLE_EXT_IDENTIFY);
+			break;
 		default:
 			return -EINVAL;
 		}
@@ -272,8 +298,14 @@ static int sanity_check_raw_super(struct f2fs_super_block *raw_super)
 
 	if (F2FS_SUPER_MAGIC != le32_to_cpu(raw_super->magic))
 		return 1;
+
+	/* Currently, support only 4KB block size */
 	blocksize = 1 << le32_to_cpu(raw_super->log_blocksize);
 	if (blocksize != PAGE_CACHE_SIZE)
+		return 1;
+	if (le32_to_cpu(raw_super->log_sectorsize) != 9)
+		return 1;
+	if (le32_to_cpu(raw_super->log_sectors_per_block) != 3)
 		return 1;
 	return 0;
 }
@@ -307,8 +339,7 @@ static void init_sb_info(struct f2fs_sb_info *sbi)
 	sbi->blocksize = 1 << sbi->log_blocksize;
 	sbi->log_blocks_per_seg = le32_to_cpu(raw_super->log_blocks_per_seg);
 	sbi->blocks_per_seg = 1 << sbi->log_blocks_per_seg;
-	sbi->log_segs_per_sec = le32_to_cpu(raw_super->log_segs_per_sec);
-	sbi->segs_per_sec = 1 << sbi->log_segs_per_sec;
+	sbi->segs_per_sec = le32_to_cpu(raw_super->segs_per_sec);
 	sbi->secs_per_zone = le32_to_cpu(raw_super->secs_per_zone);
 	sbi->total_sections = le32_to_cpu(raw_super->section_count);
 	sbi->total_node_count =
@@ -346,6 +377,8 @@ static int f2fs_fill_super(struct super_block *sb, void *data, int silent)
 	raw_super = (struct f2fs_super_block *) ((char *)raw_super_buf->b_data);
 
 	/* init some FS parameters */
+	sbi->active_logs = NR_CURSEG_TYPE;
+
 	set_opt(sbi, BG_GC);
 
 #ifdef CONFIG_F2FS_FS_XATTR
@@ -363,6 +396,8 @@ static int f2fs_fill_super(struct super_block *sb, void *data, int silent)
 		goto free_sb_buf;
 
 	sb->s_maxbytes = max_file_size(raw_super->log_blocksize);
+	sb->s_max_links = F2FS_LINK_MAX;
+
 	sb->s_op = &f2fs_sops;
 	sb->s_xattr = f2fs_xattr_handlers;
 	sb->s_magic = F2FS_SUPER_MAGIC;
@@ -510,6 +545,11 @@ static int init_inodecache(void)
 
 static void destroy_inodecache(void)
 {
+	/*
+	 * Make sure all delayed rcu free inodes are flushed before we
+	 * destroy cache.
+	 */
+	rcu_barrier();
 	kmem_cache_destroy(f2fs_inode_cachep);
 }
 
