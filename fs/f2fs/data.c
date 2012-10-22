@@ -190,8 +190,9 @@ struct page *find_data_page(struct inode *inode, pgoff_t index)
 	if (dn.data_blkaddr == NULL_ADDR)
 		return ERR_PTR(-ENOENT);
 
-	BUG_ON(dn.data_blkaddr == NEW_ADDR);
-	BUG_ON(dn.data_blkaddr == NULL_ADDR);
+	/* By fallocate(), there is no cached page, but with NEW_ADDR */
+	if (dn.data_blkaddr == NEW_ADDR)
+		return ERR_PTR(-EINVAL);
 
 	page = grab_cache_page(mapping, index);
 	if (!page)
