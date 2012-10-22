@@ -18,35 +18,6 @@
 #include "xattr.h"
 #include "acl.h"
 
-#define F2FS_LINK_MAX		32000
-
-const char *media_ext_lists[] = {
-	"jpg",
-	"gif",
-	"png",
-	"avi",
-	"divx",
-	"mp4",
-	"mp3",
-	"3gp",
-	"wmv",
-	"wma",
-	"mpeg",
-	"mkv",
-	"mov",
-	"asx",
-	"asf",
-	"wmx",
-	"svi",
-	"wvx",
-	"wm",
-	"mpg",
-	"mpe",
-	"rm",
-	"ogg",
-	NULL
-};
-
 static struct inode *f2fs_new_inode(struct inode *dir, umode_t mode)
 {
 	struct super_block *sb = dir->i_sb;
@@ -81,7 +52,7 @@ static struct inode *f2fs_new_inode(struct inode *dir, umode_t mode)
 	inode->i_ino = ino;
 	inode->i_mode = mode;
 	inode->i_blocks = 0;
-	inode->i_mtime = inode->i_atime = inode->i_ctime = CURRENT_TIME_SEC;
+	inode->i_mtime = inode->i_atime = inode->i_ctime = CURRENT_TIME;
 
 	err = insert_inode_locked(inode);
 	if (err) {
@@ -115,7 +86,7 @@ static int is_multimedia_file(const unsigned char *s, const char *sub)
 	ret = memcmp(s + slen - sublen, sub, sublen);
 	if (ret) {	/* compare upper case */
 		int i;
-		char upper_sub[6];
+		char upper_sub[8];
 		for (i = 0; i < sublen && i < sizeof(upper_sub); i++)
 			upper_sub[i] = toupper(sub[i]);
 		return memcmp(s + slen - sublen, upper_sub, sublen);
@@ -127,16 +98,18 @@ static int is_multimedia_file(const unsigned char *s, const char *sub)
 /**
  * Set multimedia files as cold files for hot/cold data separation
  */
-static inline void set_cold_file(struct inode *inode, const unsigned char *name)
+static inline void set_cold_file(struct f2fs_sb_info *sbi, struct inode *inode,
+		const unsigned char *name)
 {
-	const char **extlist = media_ext_lists;
+	int i;
+	__u8 (*extlist)[8] = sbi->raw_super->extension_list;
 
-	while (*extlist) {
-		if (!is_multimedia_file(name, *extlist)) {
-			F2FS_I(inode)->is_cold = 1;
+	int count = le32_to_cpu(sbi->raw_super->extension_count);
+	for (i = 0; i < count; i++) {
+		if (!is_multimedia_file(name, extlist[i])) {
+			F2FS_I(inode)->i_advise |= FADVISE_COLD_BIT;
 			break;
 		}
-		extlist++;
 	}
 }
 
@@ -149,14 +122,12 @@ static int f2fs_create(struct inode *dir, struct dentry *dentry, umode_t mode,
 	nid_t ino = 0;
 	int err;
 
-	if (dentry->d_name.len > F2FS_MAX_NAME_LEN)
-		return -ENAMETOOLONG;
-
 	inode = f2fs_new_inode(dir, mode);
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
 
-	set_cold_file(inode, dentry->d_name.name);
+	if (!test_opt(sbi, DISABLE_EXT_IDENTIFY))
+		set_cold_file(sbi, inode, dentry->d_name.name);
 
 	inode->i_op = &f2fs_file_inode_operations;
 	inode->i_fop = &f2fs_file_operations;
@@ -191,12 +162,6 @@ static int f2fs_link(struct dentry *old_dentry, struct inode *dir,
 	struct f2fs_sb_info *sbi = F2FS_SB(sb);
 	int err;
 
-	if (dentry->d_name.len > F2FS_MAX_NAME_LEN)
-		return -ENAMETOOLONG;
-
-	if (inode->i_nlink >= F2FS_LINK_MAX)
-		return -EMLINK;
-
 	inode->i_ctime = CURRENT_TIME;
 	atomic_inc(&inode->i_count);
 
@@ -222,7 +187,7 @@ static struct dentry *f2fs_lookup(struct inode *dir, struct dentry *dentry,
 	struct f2fs_dir_entry *de;
 	struct page *page;
 
-	if (dentry->d_name.len > NAME_MAX)
+	if (dentry->d_name.len > F2FS_MAX_NAME_LEN)
 		return ERR_PTR(-ENAMETOOLONG);
 
 	de = f2fs_find_entry(dir, &dentry->d_name, &page);
@@ -277,9 +242,6 @@ static int f2fs_symlink(struct inode *dir, struct dentry *dentry,
 	unsigned symlen = strlen(symname) + 1;
 	int err;
 
-	if (symlen > sb->s_blocksize)
-		return -ENAMETOOLONG;
-
 	inode = f2fs_new_inode(dir, S_IFLNK | S_IRWXUGO);
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
@@ -312,13 +274,7 @@ static int f2fs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
 {
 	struct f2fs_sb_info *sbi = F2FS_SB(dir->i_sb);
 	struct inode *inode;
-	int err = -EMLINK;
-
-	if (dentry->d_name.len > F2FS_MAX_NAME_LEN)
-		return -ENAMETOOLONG;
-
-	if (dir->i_nlink >= F2FS_LINK_MAX)
-		return err;
+	int err;
 
 	inode = f2fs_new_inode(dir, S_IFDIR | mode);
 	err = PTR_ERR(inode);
@@ -371,9 +327,6 @@ static int f2fs_mknod(struct inode *dir, struct dentry *dentry,
 	if (!new_valid_dev(rdev))
 		return -EINVAL;
 
-	if (dentry->d_name.len > F2FS_MAX_NAME_LEN)
-		return -ENAMETOOLONG;
-
 	inode = f2fs_new_inode(dir, mode);
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
@@ -414,9 +367,6 @@ static int f2fs_rename(struct inode *old_dir, struct dentry *old_dentry,
 	struct f2fs_dir_entry *new_entry;
 	int err = -ENOENT;
 
-	if (new_dentry->d_name.len > F2FS_MAX_NAME_LEN)
-		return -ENAMETOOLONG;
-
 	old_entry = f2fs_find_entry(old_dir, &old_dentry->d_name, &old_page);
 	if (!old_entry)
 		goto out;
@@ -445,7 +395,7 @@ static int f2fs_rename(struct inode *old_dir, struct dentry *old_dentry,
 
 		f2fs_set_link(new_dir, new_entry, new_page, old_inode);
 
-		new_inode->i_ctime = CURRENT_TIME_SEC;
+		new_inode->i_ctime = CURRENT_TIME;
 		if (old_dir_entry)
 			drop_nlink(new_inode);
 		drop_nlink(new_inode);
@@ -453,11 +403,6 @@ static int f2fs_rename(struct inode *old_dir, struct dentry *old_dentry,
 			add_orphan_inode(sbi, new_inode->i_ino);
 		f2fs_write_inode(new_inode, NULL);
 	} else {
-		if (old_dir_entry) {
-			err = -EMLINK;
-			if (new_dir->i_nlink >= F2FS_LINK_MAX)
-				goto out_dir;
-		}
 		err = f2fs_add_link(new_dentry, old_inode);
 		if (err)
 			goto out_dir;
@@ -468,7 +413,7 @@ static int f2fs_rename(struct inode *old_dir, struct dentry *old_dentry,
 		}
 	}
 
-	old_inode->i_ctime = CURRENT_TIME_SEC;
+	old_inode->i_ctime = CURRENT_TIME;
 	set_inode_flag(F2FS_I(old_inode), FI_NEED_CP);
 	mark_inode_dirty(old_inode);
 
