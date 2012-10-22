@@ -208,7 +208,7 @@ void add_orphan_inode(struct f2fs_sb_info *sbi, nid_t ino)
 		orphan = NULL;
 	}
 retry:
-	new = kmem_cache_alloc(orphan_entry_slab, GFP_NOFS);
+	new = kmem_cache_alloc(orphan_entry_slab, GFP_ATOMIC);
 	if (!new) {
 		cond_resched();
 		goto retry;
@@ -418,7 +418,7 @@ int get_valid_checkpoint(struct f2fs_sb_info *sbi)
 	 * Finding out valid cp block involves read both
 	 * sets( cp pack1 and cp pack 2)
 	 */
-	cp_start_blk_no = le64_to_cpu(fsb->start_segment_checkpoint);
+	cp_start_blk_no = le32_to_cpu(fsb->start_segment_checkpoint);
 	cp1 = validate_checkpoint(sbi, cp_start_blk_no, &cp1_version);
 
 	/* The second checkpoint pack should start at the next segment */
@@ -459,8 +459,12 @@ void set_dirty_dir_page(struct inode *inode, struct page *page)
 
 	if (!S_ISDIR(inode->i_mode))
 		return;
-
-	new = kmem_cache_alloc(inode_entry_slab, __GFP_HIGH | __GFP_NOFAIL);
+retry:
+	new = kmem_cache_alloc(inode_entry_slab, GFP_NOFS);
+	if (!new) {
+		cond_resched();
+		goto retry;
+	}
 	new->inode = inode;
 	INIT_LIST_HEAD(&new->list);
 
