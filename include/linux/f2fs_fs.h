@@ -15,8 +15,9 @@
 #include <linux/types.h>
 
 #define F2FS_SUPER_MAGIC	0xF2F52010
-#define F2FS_SUPER_OFFSET	1		/* start sector # for sb */
+#define F2FS_SUPER_OFFSET	0		/* start sector # for sb */
 #define F2FS_BLKSIZE		4096
+#define F2FS_MAX_EXTENSION	64
 
 #define NULL_ADDR		0x0U
 #define NEW_ADDR		-1U
@@ -26,6 +27,10 @@
 #define F2FS_META_INO(sbi)	(sbi->meta_ino_num)
 
 #define GFP_F2FS_MOVABLE	(__GFP_WAIT | __GFP_IO | __GFP_ZERO)
+
+#define MAX_ACTIVE_LOGS	16
+#define MAX_ACTIVE_NODE_LOGS	8
+#define MAX_ACTIVE_DATA_LOGS	8
 
 /*
  * For superblock
@@ -38,8 +43,8 @@ struct f2fs_super_block {
 	__le32 log_sectors_per_block;	/* log2 (Number of sectors per block */
 	__le32 log_blocksize;	/* log2 (Block size in bytes) */
 	__le32 log_blocks_per_seg; /* log2 (Number of blocks per segment) */
-	__le32 log_segs_per_sec; /* log2 (Number of segments per section) */
-	__le32 secs_per_zone; /* Number of sections per zone */
+	__le32 segs_per_sec;	/* Number of segments per section */
+	__le32 secs_per_zone;	/* Number of sections per zone */
 	__le32 checksum_offset;	/* Checksum position in this super block */
 	__le64 block_count;	/* Total number of blocks */
 	__le32 section_count;	/* Total number of sections */
@@ -55,17 +60,19 @@ struct f2fs_super_block {
 	/* Total number of segments in Main area */
 	__le32 segment_count_main;
 	__le32 failure_safe_block_distance;
-	__le64 segment0_blkaddr;	/* Start block address of Segment 0 */
-	__le64 start_segment_checkpoint; /* Start block address of ckpt */
-	__le64 sit_blkaddr;	/* Start block address of SIT */
-	__le64 nat_blkaddr;	/* Start block address of NAT */
-	__le64 ssa_blkaddr;     /* Start block address of SSA */
-	__le64 main_blkaddr;	/* Start block address of Main area */
+	__le32 segment0_blkaddr;	/* Start block address of Segment 0 */
+	__le32 start_segment_checkpoint; /* Start block address of ckpt */
+	__le32 sit_blkaddr;	/* Start block address of SIT */
+	__le32 nat_blkaddr;	/* Start block address of NAT */
+	__le32 ssa_blkaddr;     /* Start block address of SSA */
+	__le32 main_blkaddr;	/* Start block address of Main area */
 	__le32 root_ino;	/* Root directory inode number */
 	__le32 node_ino;	/* node inode number */
 	__le32 meta_ino;	/* meta inode number */
 	__le32 volume_serial_number;	/* VSN is optional field */
-	__le16 volume_name[8];	/* Volume Name. 8 unicode characters */
+	__le16 volume_name[512];	/* Volume Name */
+	__le32 extension_count;
+	__u8 extension_list[F2FS_MAX_EXTENSION][8]; /* extension array */
 } __packed;
 
 /*
@@ -73,30 +80,20 @@ struct f2fs_super_block {
  */
 struct f2fs_checkpoint {
 	__le64 checkpoint_ver;		/* Checkpoint block version number */
-	__le64 user_block_count;	/* Total number of blocks
-					   in Main area excluding the number of
-					   reserved blocks */
-	__le64 valid_block_count;	/* Total number of valid blocks
-					   in Main area */
-	__le32 rsvd_segment_count;	/* Total number of reserved segments
-					   (for garbage collection) */
-	__le32 overprov_segment_count;	/* Total number of overprovision
-					   segments */
-	__le32 free_segment_count;	/* Total number of free segments
-					   in Main area */
-	__le32 bad_segment_count;	/* Total number of bad segments
-					   in Main area */
-	__le32 cur_node_segno[3];	/* Segment number of current node
-					   segment */
-	__le16 cur_node_blkoff[3];	/* Current node block offset
-					   in the node segment */
-	__le16 nat_upd_blkoff[3];	/* Block offset in current node segment
-					   where the last NAT update happened */
-	__le32 cur_data_segno[3];	/* Segment number of current log
-					   segment */
-	__le16 cur_data_blkoff[3];	/* Current data block offset
-					   in the data segment */
-	__le32 ckpt_flags;		/* Flags : umount and orphan_present */
+	__le64 user_block_count;	/* # of user blocks */
+	__le64 valid_block_count;	/* # of valid blocks in Main area */
+	__le32 rsvd_segment_count;	/* # of reserved segments for gc */
+	__le32 overprov_segment_count;	/* # of overprovision segments */
+	__le32 free_segment_count;	/* # of free segments in Main area */
+
+	/* information of current node segments */
+	__le32 cur_node_segno[MAX_ACTIVE_NODE_LOGS];
+	__le16 cur_node_blkoff[MAX_ACTIVE_NODE_LOGS];
+	__le16 nat_upd_blkoff[MAX_ACTIVE_NODE_LOGS];
+	/* information of current data segments */
+	__le32 cur_data_segno[MAX_ACTIVE_DATA_LOGS];
+	__le16 cur_data_blkoff[MAX_ACTIVE_DATA_LOGS];
+	__le32 ckpt_flags;		/* Flags : umount and journal_present */
 	__le32 cp_pack_total_block_count;
 	__le32 cp_pack_start_sum;	/* start block number of data summary */
 	__le32 valid_node_count;	/* Total number of valid nodes */
@@ -108,7 +105,8 @@ struct f2fs_checkpoint {
 					   in this checkpoint block */
 	__le64 elapsed_time;		/* elapsed time while partition
 					   is mounted */
-	unsigned char alloc_type[6];	/* allocation type of current segment */
+	/* allocation type of current segment */
+	unsigned char alloc_type[MAX_ACTIVE_LOGS];
 
 	/* SIT and NAT version bitmap */
 	unsigned char sit_nat_version_bitmap[1];
@@ -138,22 +136,23 @@ struct f2fs_extent {
 } __packed;
 
 #define F2FS_MAX_NAME_LEN	256
-#define ADDRS_PER_INODE         929	/* Address Pointers in an Inode */
+#define ADDRS_PER_INODE         927	/* Address Pointers in an Inode */
 #define ADDRS_PER_BLOCK         1018	/* Address Pointers in a Direct Block */
 #define NIDS_PER_BLOCK          1018	/* Node IDs in an Indirect Block */
 
 struct f2fs_inode {
 	__le16 i_mode;			/* File mode */
-	__le16 i_reserved;		/* Reserved */
+	__u8 i_advise;			/* File hints */
+	__u8 i_reserved;		/* Reserved */
 	__le32 i_uid;			/* User ID */
 	__le32 i_gid;			/* Group ID */
 	__le32 i_links;			/* Links count */
 	__le64 i_size;			/* File size in bytes */
-	__le64 i_blocks;		/* File size in bytes */
-	__le32 i_atime;			/* Access time */
-	__le32 i_ctime;			/* inode Change time */
-	__le32 i_mtime;			/* Modification time */
-	__le32 i_btime;			/* file creation time*/
+	__le64 i_blocks;		/* File size in blocks */
+	__le64 i_ctime;			/* Inode change time */
+	__le64 i_mtime;			/* Modification time */
+	__le32 i_ctime_nsec;
+	__le32 i_mtime_nsec;
 	__le32 current_depth;
 	__le32 i_xattr_nid;		/* nid to save xattr */
 	__le32 i_flags;			/* file attributes */
@@ -170,20 +169,24 @@ struct f2fs_inode {
 } __packed;
 
 struct direct_node {
-	__le32 addr[ADDRS_PER_BLOCK];	/* aray of data block address */
+	__le32 addr[ADDRS_PER_BLOCK];	/* array of data block address */
 } __packed;
 
 struct indirect_node {
-	__le32 nid[NIDS_PER_BLOCK];	/* aray of data block address */
+	__le32 nid[NIDS_PER_BLOCK];	/* array of data block address */
 } __packed;
+
+enum {
+	COLD_BIT_SHIFT = 0,
+	FSYNC_BIT_SHIFT,
+	DENT_BIT_SHIFT,
+	OFFSET_BIT_SHIFT
+};
 
 struct node_footer {
 	__le32 nid;		/* node id */
 	__le32 ino;		/* inode nunmber */
-	__le32 cold:1;		/* cold mark */
-	__le32 fsync:1;		/* fsync mark */
-	__le32 dentry:1;	/* dentry mark */
-	__le32 offset:29;	/* offset in inode's node space */
+	__le32 flag;		/* include cold/fsync/dentry marks and offset */
 	__le64 cp_ver;		/* checkpoint version */
 	__le32 next_blkaddr;	/* next node page block address */
 } __packed;
