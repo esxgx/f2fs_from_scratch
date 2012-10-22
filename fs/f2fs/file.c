@@ -37,6 +37,8 @@ static int f2fs_vm_page_mkwrite(struct vm_area_struct *vma,
 
 	f2fs_balance_fs(sbi);
 
+	sb_start_pagefault(inode->i_sb);
+
 	mutex_lock_op(sbi, DATA_NEW);
 
 	/* block allocation */
@@ -44,10 +46,7 @@ static int f2fs_vm_page_mkwrite(struct vm_area_struct *vma,
 	err = get_dnode_of_data(&dn, page->index, 0);
 	if (err) {
 		mutex_unlock_op(sbi, DATA_NEW);
-		if (err == -ENOMEM)
-			return VM_FAULT_OOM;
-		else
-			return VM_FAULT_SIGBUS;
+		goto out;
 	}
 
 	old_blk_addr = dn.data_blkaddr;
@@ -58,7 +57,7 @@ static int f2fs_vm_page_mkwrite(struct vm_area_struct *vma,
 		if (err) {
 			f2fs_put_dnode(&dn);
 			mutex_unlock_op(sbi, DATA_NEW);
-			return VM_FAULT_SIGBUS;
+			goto out;
 		}
 	}
 	f2fs_put_dnode(&dn);
@@ -70,14 +69,15 @@ static int f2fs_vm_page_mkwrite(struct vm_area_struct *vma,
 			page_offset(page) >= i_size_read(inode) ||
 			!PageUptodate(page)) {
 		unlock_page(page);
-		return VM_FAULT_NOPAGE;
+		err = -EFAULT;
+		goto out;
 	}
 
 	/*
 	 * check to see if the page is mapped already (no holes)
 	 */
 	if (PageMappedToDisk(page))
-		return VM_FAULT_LOCKED;
+		goto out;
 
 	/* fill the page */
 	wait_on_page_writeback(page);
@@ -91,7 +91,10 @@ static int f2fs_vm_page_mkwrite(struct vm_area_struct *vma,
 	set_page_dirty(page);
 	SetPageUptodate(page);
 
-	return VM_FAULT_LOCKED;
+	file_update_time(vma->vm_file);
+out:
+	sb_end_pagefault(inode->i_sb);
+	return block_page_mkwrite_return(err);
 }
 
 static const struct vm_operations_struct f2fs_file_vm_ops = {
@@ -177,13 +180,9 @@ out:
 
 static int f2fs_file_mmap(struct file *file, struct vm_area_struct *vma)
 {
-	int err;
-
-	/* 'generic_file_mmap()' takes care of NOMMU case */
-	err = generic_file_mmap(file, vma);
-	if (!err)
-		vma->vm_ops = &f2fs_file_vm_ops;
-	return err;
+	file_accessed(file);
+	vma->vm_ops = &f2fs_file_vm_ops;
+	return 0;
 }
 
 static int truncate_data_blocks_range(struct dnode_of_data *dn, int count)
@@ -294,7 +293,7 @@ void f2fs_truncate(struct inode *inode)
 		return;
 
 	if (!truncate_blocks(inode, i_size_read(inode))) {
-		inode->i_mtime = inode->i_ctime = CURRENT_TIME_SEC;
+		inode->i_mtime = inode->i_ctime = CURRENT_TIME;
 		mark_inode_dirty(inode);
 	}
 
@@ -311,33 +310,34 @@ static int f2fs_getattr(struct vfsmount *mnt,
 }
 
 #ifdef CONFIG_F2FS_FS_POSIX_ACL
-static void dup_attr(struct inode *dst_inode, struct inode *src_inode,
-		struct f2fs_inode_info *fi)
-{
-	dst_inode->i_uid = src_inode->i_uid;
-	dst_inode->i_gid = src_inode->i_gid;
-	dst_inode->i_atime = src_inode->i_atime;
-	dst_inode->i_mtime = src_inode->i_mtime;
-	dst_inode->i_ctime = src_inode->i_ctime;
-	dst_inode->i_sb = src_inode->i_sb;
-
-	if (fi)
-		set_acl_inode(fi, src_inode->i_mode);
-	else
-		dst_inode->i_mode = src_inode->i_mode;
-}
-
-static void do_attr_copy(struct inode *inode, struct iattr *attr)
+static void __setattr_copy(struct inode *inode, const struct iattr *attr)
 {
 	struct f2fs_inode_info *fi = F2FS_I(inode);
-	struct inode copy_inode;
+	unsigned int ia_valid = attr->ia_valid;
 
-	dup_attr(&copy_inode, inode, NULL);
-	setattr_copy(&copy_inode, attr);
-	dup_attr(inode, &copy_inode, fi);
+	if (ia_valid & ATTR_UID)
+		inode->i_uid = attr->ia_uid;
+	if (ia_valid & ATTR_GID)
+		inode->i_gid = attr->ia_gid;
+	if (ia_valid & ATTR_ATIME)
+		inode->i_atime = timespec_trunc(attr->ia_atime,
+						inode->i_sb->s_time_gran);
+	if (ia_valid & ATTR_MTIME)
+		inode->i_mtime = timespec_trunc(attr->ia_mtime,
+						inode->i_sb->s_time_gran);
+	if (ia_valid & ATTR_CTIME)
+		inode->i_ctime = timespec_trunc(attr->ia_ctime,
+						inode->i_sb->s_time_gran);
+	if (ia_valid & ATTR_MODE) {
+		umode_t mode = attr->ia_mode;
+
+		if (!in_group_p(inode->i_gid) && !capable(CAP_FSETID))
+			mode &= ~S_ISGID;
+		set_acl_inode(fi, mode);
+	}
 }
 #else
-#define __do_attr_copy	setattr_copy
+#define __setattr_copy setattr_copy
 #endif
 
 int f2fs_setattr(struct dentry *dentry, struct iattr *attr)
@@ -348,16 +348,15 @@ int f2fs_setattr(struct dentry *dentry, struct iattr *attr)
 
 	err = inode_change_ok(inode, attr);
 	if (err)
-		goto out_err;
+		return err;
 
 	if ((attr->ia_valid & ATTR_SIZE) &&
-	    attr->ia_size != i_size_read(inode)) {
-		err = vmtruncate(inode, attr->ia_size);
-		if (unlikely(err))
-			goto out_err;
+			attr->ia_size != i_size_read(inode)) {
+		truncate_setsize(inode, attr->ia_size);
+		f2fs_truncate(inode);
 	}
 
-	do_attr_copy(inode, attr);
+	__setattr_copy(inode, attr);
 
 	if (attr->ia_valid & ATTR_MODE) {
 		err = f2fs_acl_chmod(inode);
@@ -368,12 +367,10 @@ int f2fs_setattr(struct dentry *dentry, struct iattr *attr)
 	}
 
 	mark_inode_dirty(inode);
-out_err:
 	return err;
 }
 
 const struct inode_operations f2fs_file_inode_operations = {
-	.truncate	= f2fs_truncate,
 	.getattr	= f2fs_getattr,
 	.setattr	= f2fs_setattr,
 	.get_acl	= f2fs_get_acl,
@@ -616,7 +613,7 @@ long f2fs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		mutex_unlock(&inode->i_mutex);
 
 		f2fs_set_inode_flags(inode);
-		inode->i_ctime = CURRENT_TIME_SEC;
+		inode->i_ctime = CURRENT_TIME;
 		mark_inode_dirty(inode);
 out:
 		mnt_drop_write(filp->f_path.mnt);
