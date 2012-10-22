@@ -119,13 +119,6 @@ static unsigned int __gang_lookup_nat_cache(struct f2fs_nm_info *nm_i,
 	return radix_tree_gang_lookup(&nm_i->nat_root, (void **)ep, start, nr);
 }
 
-static void __add_to_nat_cache(struct f2fs_nm_info *nm_i, struct nat_entry *e)
-{
-	list_add_tail(&e->list, &nm_i->nat_entries);
-	radix_tree_insert(&nm_i->nat_root, nat_get_nid(e), e);
-	nm_i->nat_cnt++;
-}
-
 static void __del_from_nat_cache(struct f2fs_nm_info *nm_i, struct nat_entry *e)
 {
 	list_del(&e->list);
@@ -152,10 +145,17 @@ static struct nat_entry *grab_nat_entry(struct f2fs_nm_info *nm_i, nid_t nid)
 {
 	struct nat_entry *new;
 
-	new = kmem_cache_alloc(nat_entry_slab, __GFP_HIGH | __GFP_NOFAIL);
+	new = kmem_cache_alloc(nat_entry_slab, GFP_ATOMIC);
+	if (!new)
+		return NULL;
+	if (radix_tree_insert(&nm_i->nat_root, nid, new)) {
+		kmem_cache_free(nat_entry_slab, new);
+		return NULL;
+	}
 	memset(new, 0, sizeof(struct nat_entry));
 	nat_set_nid(new, nid);
-	__add_to_nat_cache(nm_i, new);
+	list_add_tail(&new->list, &nm_i->nat_entries);
+	nm_i->nat_cnt++;
 	return new;
 }
 
@@ -163,11 +163,15 @@ static void cache_nat_entry(struct f2fs_nm_info *nm_i, nid_t nid,
 						struct f2fs_nat_entry *ne)
 {
 	struct nat_entry *e;
-
+retry:
 	write_lock(&nm_i->nat_tree_lock);
 	e = __lookup_nat_cache(nm_i, nid);
 	if (!e) {
 		e = grab_nat_entry(nm_i, nid);
+		if (!e) {
+			write_unlock(&nm_i->nat_tree_lock);
+			goto retry;
+		}
 		nat_set_blkaddr(e, le32_to_cpu(ne->block_addr));
 		nat_set_ino(e, le32_to_cpu(ne->ino));
 		nat_set_version(e, ne->version);
@@ -181,11 +185,15 @@ static void set_node_addr(struct f2fs_sb_info *sbi, struct node_info *ni,
 {
 	struct f2fs_nm_info *nm_i = NM_I(sbi);
 	struct nat_entry *e;
-
+retry:
 	write_lock(&nm_i->nat_tree_lock);
 	e = __lookup_nat_cache(nm_i, ni->nid);
 	if (!e) {
 		e = grab_nat_entry(nm_i, ni->nid);
+		if (!e) {
+			write_unlock(&nm_i->nat_tree_lock);
+			goto retry;
+		}
 		e->ni = *ni;
 		e->checkpointed = true;
 		BUG_ON(ni->blk_addr == NEW_ADDR);
@@ -232,11 +240,12 @@ static int try_to_free_nats(struct f2fs_sb_info *sbi, int nr_shrink)
 		return 0;
 
 	write_lock(&nm_i->nat_tree_lock);
-	while (nr_shrink-- && !list_empty(&nm_i->nat_entries)) {
+	while (nr_shrink && !list_empty(&nm_i->nat_entries)) {
 		struct nat_entry *ne;
 		ne = list_first_entry(&nm_i->nat_entries,
 					struct nat_entry, list);
 		__del_from_nat_cache(nm_i, ne);
+		nr_shrink--;
 	}
 	write_unlock(&nm_i->nat_tree_lock);
 	return nr_shrink;
@@ -395,7 +404,7 @@ int get_dnode_of_data(struct dnode_of_data *dn, pgoff_t index, int ro)
 	parent = npage[0];
 	nids[1] = get_nid(parent, offset[0], true);
 	dn->inode_page = npage[0];
-	dn->ilock = 1;
+	dn->inode_page_locked = true;
 
 	/* get indirect or direct nodes */
 	for (i = 1; i <= level; i++) {
@@ -433,7 +442,7 @@ int get_dnode_of_data(struct dnode_of_data *dn, pgoff_t index, int ro)
 			done = true;
 		}
 		if (i == 1) {
-			dn->ilock = 0;
+			dn->inode_page_locked = false;
 			unlock_page(parent);
 		} else {
 			f2fs_put_page(parent, 1);
@@ -755,7 +764,7 @@ int remove_inode_page(struct inode *inode)
 
 		F2FS_I(inode)->i_xattr_nid = 0;
 		set_new_dnode(&dn, inode, page, npage, nid);
-		dn.ilock = 1;
+		dn.inode_page_locked = 1;
 		truncate_node(&dn);
 	}
 	if (inode->i_blocks == 1) {
@@ -965,10 +974,10 @@ void sync_inode_page(struct dnode_of_data *dn)
 	if (IS_INODE(dn->node_page) || dn->inode_page == dn->node_page) {
 		update_inode(dn->inode, dn->node_page);
 	} else if (dn->inode_page) {
-		if (!dn->ilock)
+		if (!dn->inode_page_locked)
 			lock_page(dn->inode_page);
 		update_inode(dn->inode, dn->inode_page);
-		if (!dn->ilock)
+		if (!dn->inode_page_locked)
 			unlock_page(dn->inode_page);
 	} else {
 		f2fs_write_inode(dn->inode, NULL);
@@ -1280,7 +1289,7 @@ static void build_free_nids(struct f2fs_sb_info *sbi)
 	int fcnt = 0;
 	int i;
 
-	nid = get_next_scan_nid(nm_i);
+	nid = nm_i->next_scan_nid;
 	nm_i->init_scan_nid = nid;
 
 	ra_nat_pages(sbi, nid);
@@ -1303,7 +1312,7 @@ static void build_free_nids(struct f2fs_sb_info *sbi)
 			break;
 	}
 
-	set_next_scan_nid(nm_i, nid);
+	nm_i->next_scan_nid = nid;
 
 	/* find free nids from current sum_pages */
 	mutex_lock(&curseg->curseg_mutex);
@@ -1516,7 +1525,7 @@ static bool flush_nats_in_journal(struct f2fs_sb_info *sbi)
 		nid_t nid = le32_to_cpu(nid_in_journal(sum, i));
 
 		raw_ne = nat_in_journal(sum, i);
-
+retry:
 		write_lock(&nm_i->nat_tree_lock);
 		ne = __lookup_nat_cache(nm_i, nid);
 		if (ne) {
@@ -1525,6 +1534,10 @@ static bool flush_nats_in_journal(struct f2fs_sb_info *sbi)
 			continue;
 		}
 		ne = grab_nat_entry(nm_i, nid);
+		if (!ne) {
+			write_unlock(&nm_i->nat_tree_lock);
+			goto retry;
+		}
 		nat_set_blkaddr(ne, le32_to_cpu(raw_ne.block_addr));
 		nat_set_ino(ne, le32_to_cpu(raw_ne.ino));
 		nat_set_version(ne, raw_ne.version);
@@ -1648,8 +1661,7 @@ static int init_node_manager(struct f2fs_sb_info *sbi)
 	unsigned char *version_bitmap;
 	int i;
 
-	/* TODO : check, block or sector addr? */
-	nm_i->nat_blkaddr = le64_to_cpu(sb_raw->nat_blkaddr);
+	nm_i->nat_blkaddr = le32_to_cpu(sb_raw->nat_blkaddr);
 
 	/* segment_count_nat includes pair segment so divide to 2. */
 	nm_i->nat_segs = le32_to_cpu(sb_raw->segment_count_nat) >> 1;
@@ -1660,16 +1672,14 @@ static int init_node_manager(struct f2fs_sb_info *sbi)
 	nm_i->nat_cnt = 0;
 
 	INIT_LIST_HEAD(&nm_i->free_nid_list);
-	INIT_RADIX_TREE(&nm_i->nat_root, __GFP_HIGH | __GFP_NOFAIL);
+	INIT_RADIX_TREE(&nm_i->nat_root, GFP_ATOMIC);
 	INIT_LIST_HEAD(&nm_i->nat_entries);
 	INIT_LIST_HEAD(&nm_i->dirty_nat_entries);
 
 	mutex_init(&nm_i->build_lock);
 	spin_lock_init(&nm_i->free_nid_list_lock);
 	rwlock_init(&nm_i->nat_tree_lock);
-	spin_lock_init(&nm_i->stat_lock);
 
-	/* TODO : should be initialized from checkpoint manager */
 	for (i = 0; i < 3; i++) {
 		nm_i->lst_upd_blkoff[i] =
 			le16_to_cpu(sbi->ckpt->nat_upd_blkoff[i]);
@@ -1681,7 +1691,6 @@ static int init_node_manager(struct f2fs_sb_info *sbi)
 	nm_i->written_valid_inode_count = sbi->total_valid_inode_count;
 
 	nm_i->bitmap_size = __bitmap_size(sbi, NAT_BITMAP);
-	/* TODO : get variable from checkpoint */
 	nm_i->init_scan_nid = le32_to_cpu(sbi->ckpt->next_free_nid);
 	nm_i->next_scan_nid = le32_to_cpu(sbi->ckpt->next_free_nid);
 
