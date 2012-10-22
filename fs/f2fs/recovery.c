@@ -48,7 +48,7 @@ static int recover_dentry(struct page *ipage, struct inode *inode)
 	struct inode *dir;
 	int err = 0;
 
-	if (!raw_node->footer.dentry)
+	if (!is_dent_dnode(ipage))
 		goto out;
 
 	dir = f2fs_iget(inode->i_sb, le32_to_cpu(raw_inode->i_pino));
@@ -83,9 +83,12 @@ static int recover_inode(struct inode *inode, struct page *node_page)
 
 	inode->i_mode = le32_to_cpu(raw_inode->i_mode);
 	i_size_write(inode, le64_to_cpu(raw_inode->i_size));
-	inode->i_atime.tv_sec = le32_to_cpu(raw_inode->i_atime);
-	inode->i_ctime.tv_sec = le32_to_cpu(raw_inode->i_ctime);
-	inode->i_mtime.tv_sec = le32_to_cpu(raw_inode->i_mtime);
+	inode->i_atime.tv_sec = le64_to_cpu(raw_inode->i_mtime);
+	inode->i_ctime.tv_sec = le64_to_cpu(raw_inode->i_ctime);
+	inode->i_mtime.tv_sec = le64_to_cpu(raw_inode->i_mtime);
+	inode->i_atime.tv_nsec = le32_to_cpu(raw_inode->i_mtime_nsec);
+	inode->i_ctime.tv_nsec = le32_to_cpu(raw_inode->i_ctime_nsec);
+	inode->i_mtime.tv_nsec = le32_to_cpu(raw_inode->i_mtime_nsec);
 
 	return recover_dentry(node_page, inode);
 }
